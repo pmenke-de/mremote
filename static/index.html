@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<title>mremote</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="mremote">
+<style>
+  html, body { margin:0; height:100%; background:#111; color:#888; overflow:hidden;
+    -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; font:14px -apple-system, sans-serif; }
+  #pad { position:fixed; inset:0; touch-action:none; background:#1a1a1a; }
+  #pad.drag { background:#1e2430; }
+  #status { position:fixed; top:env(safe-area-inset-top, 8px); left:0; right:0; text-align:center;
+    padding:8px; pointer-events:none; font-size:12px; letter-spacing:.05em; }
+  #status.on { color:#4c4; } #status.off { color:#c44; }
+  #hint { position:fixed; bottom:calc(env(safe-area-inset-bottom, 0px) + 12px); left:12px; right:64px;
+    pointer-events:none; font-size:11px; color:#555; line-height:1.6; }
+  #kbtoggle { position:fixed; right:12px; bottom:calc(env(safe-area-inset-bottom, 0px) + 12px);
+    width:44px; height:44px; border-radius:22px; background:#333; color:#ccc; font-size:22px;
+    display:flex; align-items:center; justify-content:center; touch-action:none; }
+  #kbtoggle.on { background:#4a6; color:#fff; }
+  #keybar { position:fixed; top:calc(env(safe-area-inset-top, 8px) + 34px); left:0; right:0;
+    display:none; grid-template-columns:repeat(6, 1fr); gap:6px; padding:6px 8px; background:#222; touch-action:none; }
+  #keybar.on { display:grid; }
+  #keybar button { height:40px; border:0; border-radius:6px; padding:0;
+    background:#3a3a3a; color:#ddd; font:16px -apple-system, sans-serif; touch-action:none; }
+  #keybar button.mod.active { background:#4a6; color:#fff; }
+  #kb { position:fixed; top:0; left:0; width:1px; height:1px; opacity:.01; border:0; padding:0;
+    font-size:16px; resize:none; } /* font-size ≥16px verhindert Auto-Zoom in Safari */
+</style>
+</head>
+<body>
+<div id="pad"></div>
+<div id="status" class="off">verbinde…</div>
+<div id="keybar">
+  <button data-key="esc">esc</button><button data-key="tab">tab</button>
+  <button class="mod" data-mod="cmd">⌘</button><button class="mod" data-mod="alt">⌥</button>
+  <button class="mod" data-mod="ctrl">⌃</button><button class="mod" data-mod="shift">⇧</button>
+  <button data-key="fwddel">⌦</button><button data-key="backspace">⌫</button>
+  <button data-key="left">←</button><button data-key="up">↑</button>
+  <button data-key="down">↓</button><button data-key="right">→</button>
+</div>
+<textarea id="kb" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
+<div id="hint">1 Finger: bewegen · Tipp: Klick · 2× Tipp: Doppelklick · Tipp, Tipp+halten: ziehen/markieren<br>2 Finger tippen: Rechtsklick · 2 Finger wischen: scrollen</div>
+<div id="kbtoggle">⌨</div>
+<script>
+// ---------------------------------------------------------------- Einstellungen
+const BASE_GAIN   = 1.4;   // Grundübersetzung Finger-px → Mauszeiger-px
+const ACCEL       = 0.09;  // Beschleunigung pro px Bewegung je Event
+const MAX_GAIN    = 5;
+const SCROLL_GAIN = 1.5;
+const INVERT_SCROLL = false; // auf true, falls die Scrollrichtung falsch herum ist
+const TAP_MAX_MS  = 300;   // kürzer als das + kaum Bewegung = Tipp
+const TAP_MAX_PX  = 12;
+const DRAG_TAP_MS = 350;   // zweiter Tipp innerhalb dieser Zeit nach einem Tipp = Drag-Kandidat
+
+// ---------------------------------------------------------------- WebSocket
+const token = new URLSearchParams(location.search).get('t') || '';
+const status = document.getElementById('status');
+let ws = null;
+
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/ws?t=${encodeURIComponent(token)}`);
+  ws.onopen  = () => { status.textContent = 'verbunden'; status.className = 'on'; };
+  ws.onclose = () => { status.textContent = 'getrennt – verbinde neu…'; status.className = 'off'; setTimeout(connect, 1000); };
+  ws.onerror = () => ws.close();
+}
+function send(s) { if (ws && ws.readyState === 1) ws.send(s); }
+connect();
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && (!ws || ws.readyState > 1)) connect();
+});
+
+// ---------------------------------------------------------------- Touchpad-Gesten
+const pad = document.getElementById('pad');
+let g = null;        // aktuelle Geste
+let lastTap = null;  // {t} des letzten 1-Finger-Tipps, für Tipp-Tipp-Halten
+
+function centroid(touches) {
+  let x = 0, y = 0;
+  for (const t of touches) { x += t.clientX; y += t.clientY; }
+  return { x: x / touches.length, y: y / touches.length, n: touches.length };
+}
+
+function startDrag() {
+  if (g.dragging) return;
+  g.dragging = true;
+  pad.classList.add('drag');
+  send('d,1');
+}
+
+pad.addEventListener('touchstart', e => {
+  e.preventDefault(); // verhindert auch, dass das Textfeld den Fokus verliert
+  const c = centroid(e.touches);
+  if (!g) {
+    g = { t0: performance.now(), maxN: 0, moved: 0, dragging: false, dragCandidate: false };
+    if (c.n === 1 && lastTap && performance.now() - lastTap.t < DRAG_TAP_MS) {
+      g.dragCandidate = true;
+      // Halten ohne Bewegung → nach TAP_MAX_MS trotzdem Drag starten (z. B. Text markieren ab Stelle)
+      g.holdTimer = setTimeout(() => { if (g && g.dragCandidate && g.n === 1) startDrag(); }, TAP_MAX_MS);
+    }
+  }
+  g.maxN = Math.max(g.maxN, c.n);
+  g.cx = c.x; g.cy = c.y; g.n = c.n;   // Bezugspunkt neu setzen, wenn Fingerzahl wechselt
+}, { passive: false });
+
+pad.addEventListener('touchmove', e => {
+  e.preventDefault();
+  if (!g) return;
+  const c = centroid(e.touches);
+  if (c.n !== g.n) { g.cx = c.x; g.cy = c.y; g.n = c.n; return; }
+  const dx = c.x - g.cx, dy = c.y - g.cy;
+  g.cx = c.x; g.cy = c.y;
+  const dist = Math.hypot(dx, dy);
+  g.moved += dist;
+  if (c.n === 1) {
+    if (g.dragCandidate && g.moved >= TAP_MAX_PX) startDrag();
+    const gain = Math.min(MAX_GAIN, BASE_GAIN + dist * ACCEL);
+    send(`m,${(dx * gain).toFixed(2)},${(dy * gain).toFixed(2)}`);
+  } else if (c.n >= 2) {
+    const s = INVERT_SCROLL ? -SCROLL_GAIN : SCROLL_GAIN;
+    send(`s,${(dx * s).toFixed(1)},${(dy * s).toFixed(1)}`);
+  }
+}, { passive: false });
+
+function touchEnd(e) {
+  e.preventDefault();
+  if (!g) return;
+  if (e.touches.length > 0) {
+    const c = centroid(e.touches);
+    g.cx = c.x; g.cy = c.y; g.n = c.n;
+    return;
+  }
+  clearTimeout(g.holdTimer);
+  const dur = performance.now() - g.t0;
+  if (g.dragging) {
+    send('d,0');
+    pad.classList.remove('drag');
+    lastTap = null;
+  } else if (dur < TAP_MAX_MS && g.moved < TAP_MAX_PX) {
+    if (g.maxN >= 2) { send('c,r'); lastTap = null; }
+    else { send('c,l'); lastTap = { t: performance.now() }; }
+  } else {
+    lastTap = null;
+  }
+  g = null;
+}
+pad.addEventListener('touchend', touchEnd, { passive: false });
+pad.addEventListener('touchcancel', touchEnd, { passive: false });
+
+// ---------------------------------------------------------------- Tastatur
+const kb = document.getElementById('kb');
+const keybar = document.getElementById('keybar');
+const kbtoggle = document.getElementById('kbtoggle');
+const SENTINEL = '​';   // bleibt immer im Feld, damit Backspace bei „leerem“ Feld feuert
+let prev = SENTINEL;
+let mods = new Set();
+
+function resetField() { kb.value = SENTINEL; prev = SENTINEL; }
+resetField();
+
+function modString() { return ['cmd', 'alt', 'ctrl', 'shift'].filter(m => mods.has(m)).join('+'); }
+function clearMods() {
+  mods.clear();
+  keybar.querySelectorAll('.mod').forEach(b => b.classList.remove('active'));
+}
+function sendKey(key) { send(`k,${modString()},${key}`); clearMods(); }
+
+// Diff altes/neues Feld → Backspaces + neuer Text. Behandelt so auch Autokorrektur sauber.
+kb.addEventListener('input', () => {
+  const cur = kb.value;
+  let p = 0;
+  while (p < prev.length && p < cur.length && prev[p] === cur[p]) p++;
+  let s = 0;
+  while (s < prev.length - p && s < cur.length - p && prev[prev.length - 1 - s] === cur[cur.length - 1 - s]) s++;
+  const removed = prev.length - p - s;
+  const added = cur.slice(p, cur.length - s);
+  for (let i = 0; i < removed; i++) send('k,,backspace');
+  let buf = '';
+  const flush = () => { if (buf) { send('t,' + buf); buf = ''; } };
+  for (const ch of added) {
+    if (ch === '\n') { flush(); sendKey('return'); }
+    else if (mods.size) { flush(); sendKey(ch); }
+    else buf += ch;
+  }
+  flush();
+  prev = cur;
+  if (!cur.startsWith(SENTINEL) || cur.length > 400) resetField();
+});
+
+function onBar(e) {
+  e.preventDefault();
+  const b = e.target.closest('button');
+  if (!b) return;
+  if (b.dataset.mod) {
+    mods.has(b.dataset.mod) ? mods.delete(b.dataset.mod) : mods.add(b.dataset.mod);
+    b.classList.toggle('active', mods.has(b.dataset.mod));
+  } else if (b.dataset.key) {
+    sendKey(b.dataset.key);
+  }
+}
+keybar.addEventListener('touchstart', onBar, { passive: false });
+
+function setKbUI(on) { keybar.classList.toggle('on', on); kbtoggle.classList.toggle('on', on); }
+kbtoggle.addEventListener('touchstart', e => {
+  e.preventDefault();
+  if (document.activeElement === kb) { kb.blur(); } else { kb.focus(); }
+}, { passive: false });
+kb.addEventListener('focus', () => setKbUI(true));
+kb.addEventListener('blur', () => { setKbUI(false); clearMods(); });
+
+// Bildschirm anlassen, falls verfügbar (braucht i.d.R. https, schadet aber nicht)
+if (navigator.wakeLock) {
+  const lock = () => navigator.wakeLock.request('screen').catch(() => {});
+  lock(); document.addEventListener('visibilitychange', () => { if (!document.hidden) lock(); });
+}
+</script>
+</body>
+</html>
